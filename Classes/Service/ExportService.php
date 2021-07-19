@@ -51,11 +51,10 @@ class ExportService
     protected $contextFactory;
 
     /**
-     * Doctrine's Entity Manager. Note that "ObjectManager" is the name of the related
-     * interface ...
+     * Doctrine's Entity Manager.
      *
      * @Flow\Inject
-     * @var \Doctrine\Common\Persistence\ObjectManager
+     * @var \Doctrine\ORM\EntityManagerInterface
      */
     protected $entityManager;
 
@@ -97,15 +96,16 @@ class ExportService
      * @param string $targetLanguage
      * @param \DateTime $modifiedAfter
      * @param boolean $ignoreHidden
+     * @param bool $excludeChildDocuments
      * @return string
      */
-    public function exportToString($startingPoint, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $ignoreHidden = true)
+    public function exportToString($startingPoint, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $ignoreHidden = true, $excludeChildDocuments = false)
     {
         $this->xmlWriter = new \XMLWriter();
         $this->xmlWriter->openMemory();
         $this->xmlWriter->setIndent(true);
 
-        $this->export($startingPoint, $sourceLanguage, $targetLanguage, $modifiedAfter, 'live', $ignoreHidden);
+        $this->export($startingPoint, $sourceLanguage, $targetLanguage, $modifiedAfter, 'live', $ignoreHidden, $excludeChildDocuments);
 
         return $this->xmlWriter->outputMemory(true);
     }
@@ -119,15 +119,16 @@ class ExportService
      * @param string $targetLanguage
      * @param \DateTime $modifiedAfter
      * @param boolean $ignoreHidden
+     * @param bool $excludeChildDocuments
      * @return void
      */
-    public function exportToFile($pathAndFilename, $startingPoint, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $ignoreHidden = true)
+    public function exportToFile($pathAndFilename, $startingPoint, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $ignoreHidden = true, $excludeChildDocuments = false)
     {
         $this->xmlWriter = new \XMLWriter();
         $this->xmlWriter->openUri($pathAndFilename);
         $this->xmlWriter->setIndent(true);
 
-        $this->export($startingPoint, $sourceLanguage, $targetLanguage, $modifiedAfter, 'live', $ignoreHidden);
+        $this->export($startingPoint, $sourceLanguage, $targetLanguage, $modifiedAfter, 'live', $ignoreHidden, $excludeChildDocuments);
 
         $this->xmlWriter->flush();
     }
@@ -141,9 +142,10 @@ class ExportService
      * @param \DateTime $modifiedAfter
      * @param string $workspaceName
      * @param boolean $ignoreHidden
+     * @param bool $excludeChildDocuments
      * @return void
      */
-    protected function export($startingPoint, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $workspaceName = 'live', $ignoreHidden = true)
+    protected function export($startingPoint, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $workspaceName = 'live', $ignoreHidden = true, $excludeChildDocuments = false)
     {
         $siteNodeName = current(explode('/', $startingPoint));
         /** @var Site $site */
@@ -176,7 +178,7 @@ class ExportService
             $this->xmlWriter->writeAttribute('modifiedAfter', $targetLanguage);
         }
 
-        $this->exportNodes('/sites/' . $startingPoint, $contentContext, $sourceLanguage, $targetLanguage, $modifiedAfter);
+        $this->exportNodes('/sites/' . $startingPoint, $contentContext, $sourceLanguage, $targetLanguage, $modifiedAfter, $excludeChildDocuments);
 
         $this->xmlWriter->endElement();
         $this->xmlWriter->endDocument();
@@ -191,12 +193,13 @@ class ExportService
      * @param string $sourceLanguage
      * @param string $targetLanguage
      * @param \DateTime $modifiedAfter
+     * @param bool $excludeChildDocuments
      * @return void
      */
-    public function exportNodes($startingPointNodePath, ContentContext $contentContext, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null)
+    public function exportNodes($startingPointNodePath, ContentContext $contentContext, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $excludeChildDocuments = false)
     {
-        $this->securityContext->withoutAuthorizationChecks(function () use ($startingPointNodePath, $contentContext, $sourceLanguage, $targetLanguage, $modifiedAfter) {
-            $nodeDataList = $this->findNodeDataListToExport($startingPointNodePath, $contentContext, $sourceLanguage, $targetLanguage, $modifiedAfter);
+        $this->securityContext->withoutAuthorizationChecks(function () use ($startingPointNodePath, $contentContext, $sourceLanguage, $targetLanguage, $modifiedAfter, $excludeChildDocuments) {
+            $nodeDataList = $this->findNodeDataListToExport($startingPointNodePath, $contentContext, $sourceLanguage, $targetLanguage, $modifiedAfter, $excludeChildDocuments);
             $this->exportNodeDataList($nodeDataList);
         });
     }
@@ -210,9 +213,10 @@ class ExportService
      * @param string $sourceLanguage
      * @param string $targetLanguage
      * @param \DateTime $modifiedAfter
+     * @param bool $excludeChildDocuments
      * @return array<NodeData>
      */
-    protected function findNodeDataListToExport($pathStartingPoint, ContentContext $contentContext, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null)
+    protected function findNodeDataListToExport($pathStartingPoint, ContentContext $contentContext, $sourceLanguage, $targetLanguage = null, \DateTime $modifiedAfter = null, $excludeChildDocuments = false)
     {
         $allowedContentCombinations = $this->getAllowedContentCombinationsForSourceLanguage($sourceLanguage);
         $sourceContexts = [];
@@ -220,10 +224,17 @@ class ExportService
         /** @var NodeData[] $nodeDataList */
         $nodeDataList = [];
         foreach ($allowedContentCombinations as $contentDimensions) {
+            // If exclude-child-documents argument is set to true, only add content child nodes to nodeDataList (recursively), don't descend into document child nodes.
+            if ($excludeChildDocuments) {
+                $node = $contentContext->getNode($pathStartingPoint)->getNodeData();
+                $childNodes = $this->getChildNodeDataOnPage($node, $contentContext->getWorkspace(), $contentDimensions, $contentContext->isRemovedContentShown());
+            } else {
+                $childNodes = $this->nodeDataRepository->findByParentAndNodeType($pathStartingPoint, null, $contentContext->getWorkspace(), $contentDimensions, $contentContext->isRemovedContentShown() ? null : false, true);
+            }
             $nodeDataList = array_merge(
                 $nodeDataList,
                 [$contentContext->getNode($pathStartingPoint)->getNodeData()],
-                $this->nodeDataRepository->findByParentAndNodeType($pathStartingPoint, null, $contentContext->getWorkspace(), $contentDimensions, $contentContext->isRemovedContentShown() ? null : false, true)
+                $childNodes
             );
             $sourceContexts[] = $this->contextFactory->create([
                 'invisibleContentShown' => $contentContext->isInvisibleContentShown(),
@@ -430,5 +441,53 @@ class ExportService
         return array_filter($allAllowedContentCombinations, function ($combination) use ($sourceLanguage) {
             return (isset($combination[$this->languageDimension]) && $combination[$this->languageDimension][0] === $sourceLanguage);
         });
+    }
+    
+    /**
+     * Find all content nodes under the given node.
+     *
+     * @param NodeData $node
+     * @param $workspace
+     * @param $contentDimensions
+     * @param boolean $isRemovedContentShown
+     * @return array
+     */
+    private function getChildNodeDataOnPage(NodeData $node, $workspace, $contentDimensions, $isRemovedContentShown)
+    {
+        $results = [];
+        // We traverse through all Content (=!Document) nodes underneath the start node here and add it to the result list.
+        // NOTE: The $results list is passed into the callback by reference, so that we can modify it in-place.
+        $this->traverseRecursively($node, '!Neos.Neos:Document', $workspace, $contentDimensions, $isRemovedContentShown, function($node) use (&$results) {
+            $results[] = $node;
+        });
+        return $results;
+    }
+
+    /**
+     * This function recursively traverses all nodes underneath $node which match $nodeTypeFilter; and calls
+     * $callback on each of them (Depth-First Traversal).
+     *
+     * You have to watch out yourself to not build very deep nesting; so we suggest to use a node type filter
+     * like "!Neos.Neos:Document" or "Neos.Neos:ContentCollection, Neos.Neos:Content" which matches only content.
+     *
+     * For reference how the Node Type filter works, see:
+     *
+     * - NodeDataRepository::addNodeTypeFilterConstraintsToQueryBuilder
+     * - NodeDataRepository::getNodeTypeFilterConstraintsForDql
+     *
+     * @param NodeData $node
+     * @param string $nodeTypeFilter
+     * @param $workspace
+     * @param $contentDimensions
+     * @param boolean $isRemovedContentShown
+     * @param \Closure $callback
+     */
+    private function traverseRecursively(NodeData $node, $nodeTypeFilter, $workspace, $contentDimensions, $isRemovedContentShown, \Closure $callback)
+    {
+        $callback($node);
+        $childNodes = $this->nodeDataRepository->findByParentAndNodeType($node->getPath(), $nodeTypeFilter, $workspace, $contentDimensions, $isRemovedContentShown ? null : false, false);
+        foreach ($childNodes as $childNode) {
+            $this->traverseRecursively($childNode, $nodeTypeFilter, $workspace, $contentDimensions, $isRemovedContentShown, $callback);
+        }
     }
 }
